@@ -1,4 +1,4 @@
-module libsql-handler
+module github.com/sh-lucas/libsql-handler
 
 go 1.25.4
 

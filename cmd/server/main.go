@@ -8,7 +8,7 @@ import (
 	"net/http"
 	"time"
 
-	libsqlhandler "libsql-handler"
+	libsqlhandler "github.com/sh-lucas/libsql-handler"
 
 	_ "modernc.org/sqlite"
 )
