@@ -7,7 +7,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"log"
 	"net/http"
 	"strings"
 	"sync"
@@ -211,7 +210,6 @@ func (h *LibSQLHandler) getOrCreateSession(w http.ResponseWriter, r *http.Reques
 		SameSite: http.SameSiteLaxMode,
 	})
 
-	log.Printf("[Session] Created new session %s", sessionID)
 	return s, nil
 }
 
@@ -223,7 +221,6 @@ func (h *LibSQLHandler) cleanupIdleSessions() {
 		now := time.Now()
 		for id, s := range h.sessions {
 			if now.Sub(s.LastUsed) > h.sessionTimeout {
-				log.Printf("[Session] Purging idle session %s", id)
 				s.Conn.Close()
 				delete(h.sessions, id)
 			}
@@ -258,13 +255,8 @@ func (h *LibSQLHandler) walFlushDebouncer() {
 			timerChan = nil
 			timer = nil
 			// 1 second of query silence has passed! Flush the WAL buffer to disk.
-			log.Println("[WAL] 1 second of query inactivity. Executing wal_checkpoint...")
 			// Using TRUNCATE checkpoint mode to flush WAL to the main .db file and shrink WAL file size.
-			if _, err := h.db.Exec("PRAGMA wal_checkpoint(TRUNCATE);"); err != nil {
-				log.Printf("[WAL] Checkpoint failed: %v", err)
-			} else {
-				log.Println("[WAL] Checkpoint succeeded. WAL buffer flushed to database file on disk.")
-			}
+			_, _ = h.db.Exec("PRAGMA wal_checkpoint(TRUNCATE);")
 		}
 	}
 }
@@ -301,7 +293,6 @@ func (h *LibSQLHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func (h *LibSQLHandler) handlePostQuery(w http.ResponseWriter, r *http.Request) {
 	s, err := h.getOrCreateSession(w, r)
 	if err != nil {
-		log.Printf("[Error] Failed to resolve session: %v", err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -313,7 +304,6 @@ func (h *LibSQLHandler) handlePostQuery(w http.ResponseWriter, r *http.Request) 
 
 	var req Request
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		log.Printf("[Error] Failed to decode JSON request: %v", err)
 		http.Error(w, "Invalid JSON body", http.StatusBadRequest)
 		return
 	}
@@ -335,25 +325,22 @@ func (h *LibSQLHandler) handlePostQuery(w http.ResponseWriter, r *http.Request) 
 			}
 		}
 
-		log.Printf("[Query] Executing Statement %d: Query=%q, Args=%+v", i, stmt.Query, args)
+		// Print only the executed SQL queries in bold blue color to the terminal
+		fmt.Printf("\033[1;34m%s\033[0m\n", stmt.Query)
 
 		// Execute statement
 		results, err := executeSQL(ctx, s.Conn, stmt.Query, args)
 		if err != nil {
 			resp.Error = err.Error()
-			log.Printf("[Query] Statement %d failed with error: %v", i, err)
 		} else {
 			results.QueryDurationMs = float64(time.Since(startTime).Nanoseconds()) / 1e6
 			resp.Results = results
-			log.Printf("[Query] Statement %d succeeded. Columns=%+v, RowsCount=%d, RowsWritten=%d", i, results.Columns, len(results.Rows), results.RowsWritten)
 		}
 		responses[i] = resp
 	}
 
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	if err := json.NewEncoder(w).Encode(responses); err != nil {
-		log.Printf("[Error] Failed to encode response: %v", err)
-	}
+	_ = json.NewEncoder(w).Encode(responses)
 
 	// Trigger the WAL flush debouncer in a non-blocking way
 	select {
