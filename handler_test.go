@@ -1,7 +1,8 @@
-package main
+package libsqlhandler
 
 import (
 	"bytes"
+	"database/sql"
 	"encoding/json"
 	"net/http"
 	"net/http/cookiejar"
@@ -10,14 +11,19 @@ import (
 	"os"
 	"strings"
 	"testing"
+
+	_ "modernc.org/sqlite"
 )
 
 func TestVersionEndpoint(t *testing.T) {
 	// Initialize a temporary in-memory database handler
-	h, err := NewLibSQLHandler("sqlite", ":memory:")
+	db, err := sql.Open("sqlite", ":memory:")
 	if err != nil {
-		t.Fatalf("failed to create handler: %v", err)
+		t.Fatalf("failed to open database: %v", err)
 	}
+	defer db.Close()
+
+	h := New(db)
 	defer h.Close()
 
 	server := httptest.NewServer(h)
@@ -45,10 +51,13 @@ func TestVersionEndpoint(t *testing.T) {
 }
 
 func TestExecuteSimpleAndParameterized(t *testing.T) {
-	h, err := NewLibSQLHandler("sqlite", ":memory:")
+	db, err := sql.Open("sqlite", ":memory:")
 	if err != nil {
-		t.Fatalf("failed to create handler: %v", err)
+		t.Fatalf("failed to open database: %v", err)
 	}
+	defer db.Close()
+
+	h := New(db)
 	defer h.Close()
 
 	server := httptest.NewServer(h)
@@ -114,7 +123,7 @@ func TestExecuteSimpleAndParameterized(t *testing.T) {
 
 func TestSessionStateTransactions(t *testing.T) {
 	// Dynamically create a unique temp file for the SQLite database
-	tempFile, err := os.CreateTemp("", "libsql_test_*.db")
+	tempFile, err := os.CreateTemp("data", "libsql_test_*.db")
 	if err != nil {
 		t.Fatalf("failed to create temp file: %v", err)
 	}
@@ -122,10 +131,13 @@ func TestSessionStateTransactions(t *testing.T) {
 	tempFile.Close()
 	defer os.Remove(tempFileName) // clean up after test completes
 
-	h, err := NewLibSQLHandler("sqlite", tempFileName)
+	db, err := sql.Open("sqlite", tempFileName)
 	if err != nil {
-		t.Fatalf("failed to create handler: %v", err)
+		t.Fatalf("failed to open database: %v", err)
 	}
+	defer db.Close()
+
+	h := New(db)
 	defer h.Close()
 
 	server := httptest.NewServer(h)

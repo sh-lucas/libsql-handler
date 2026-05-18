@@ -1,28 +1,42 @@
 package main
 
 import (
+	"database/sql"
 	"flag"
 	"fmt"
 	"log"
 	"net/http"
+	"time"
+
+	libsqlhandler "libsql-handler"
+
+	_ "modernc.org/sqlite"
 )
 
 func main() {
 	port := flag.Int("port", 8080, "Port to run the HTTP server on")
-	dbPath := flag.String("db", "local.db", "SQLite database file path")
+	dbPath := flag.String("db", "data/local.db", "SQLite database file path")
 	flag.Parse()
 
-	log.Printf("Initializing LibSQL HTTP handler using database file: %s...", *dbPath)
+	log.Printf("Opening SQLite database file using pure Go driver: %s...", *dbPath)
 
-	// Create and initialize the LibSQLHandler using the modernc.org/sqlite (pure Go) driver
-	h, err := NewLibSQLHandler("sqlite", *dbPath)
+	db, err := sql.Open("sqlite", *dbPath)
 	if err != nil {
-		log.Fatalf("Failed to initialize database: %v", err)
+		log.Fatalf("Failed to open database: %v", err)
 	}
+
+	// Configure standard connection pool settings
+	db.SetMaxOpenConns(100)
+	db.SetMaxIdleConns(10)
+	db.SetConnMaxLifetime(time.Hour)
+
+	// Create and initialize the LibSQLHandler using dependency injection
+	h := libsqlhandler.New(db)
 	defer h.Close()
+	defer db.Close()
 
 	// Print beautiful connection details for DBeaver
-	fmt.Println(`
+	fmt.Printf(`
 ================================================================================
   LibSQL Go Handler started successfully!
 ================================================================================
@@ -32,14 +46,15 @@ func main() {
   1. Open DBeaver and go to "Database" -> "New Database Connection".
   2. Search and select the "LibSQL" driver (included by default).
   3. Configure the connection settings:
-     - URL: http://localhost:` + fmt.Sprintf("%d", *port) + `
+     - URL: http://localhost:%d
      - Host: localhost
-     - Port: ` + fmt.Sprintf("%d", *port) + `
+     - Port: %d
      - Username: (leave empty)
      - Password: (leave empty, or any token)
   4. Test the connection! It will connect to your local SQLite file: %s
 
-================================================================================`)
+================================================================================
+`, *port, *port, *dbPath)
 
 	// Start the HTTP server with our handler
 	serverAddr := fmt.Sprintf(":%d", *port)
@@ -51,7 +66,6 @@ func main() {
 	}
 }
 
-// Ensure local.db is closed if the process is terminated
 func init() {
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
 }

@@ -1,4 +1,4 @@
-package main
+package libsqlhandler
 
 import (
 	"context"
@@ -12,8 +12,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-
-	_ "modernc.org/sqlite"
 )
 
 // Statement represents a SQL query with optional parameters.
@@ -90,12 +88,12 @@ func (s *Statement) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
-// Request represents the incoming HTTP POST request containing database statements.
+// Request represents the incoming HTTP POST batch query request.
 type Request struct {
 	Statements []Statement `json:"statements"`
 }
 
-// Results represents the output columns and rows returned to the client.
+// Results represents the data shape returned for a single SQL statement execution.
 type Results struct {
 	Columns         []string        `json:"columns"`
 	Rows            [][]interface{} `json:"rows"`
@@ -104,55 +102,48 @@ type Results struct {
 	QueryDurationMs float64         `json:"query_duration_ms"`
 }
 
-// StatementResponse represents the execution result or error for a single statement.
+// StatementResponse represents the payload wrapped for each SQL statement execution.
 type StatementResponse struct {
-	Error   string   `json:"error,omitempty"`
 	Results *Results `json:"results,omitempty"`
+	Error   string   `json:"error,omitempty"`
 }
 
-// Session represents a stateful connection to the database.
-// This is critical because HTTP is stateless, but DBeaver expects transactions
-// (e.g. BEGIN, COMMIT) to run on the exact same SQLite connection.
+// Session represents a persistent, sticky SQLite connection associated with a client cookie.
 type Session struct {
-	ID        string
-	Conn      *sql.Conn
-	LastUsed  time.Time
-	Mutex     sync.Mutex
+	ID       string
+	Conn     *sql.Conn
+	LastUsed time.Time
+	Mutex    sync.Mutex
 }
 
-// LibSQLHandler wraps the SQLite database and session map.
+// LibSQLHandler serves HTTP requests matching DBeaver JDBC client protocol.
 type LibSQLHandler struct {
 	db             *sql.DB
 	sessions       map[string]*Session
 	mu             sync.RWMutex
 	sessionTimeout time.Duration
+	flushChan      chan struct{}
 }
 
-// NewLibSQLHandler initializes the handler and database connection.
-func NewLibSQLHandler(driverName, dataSourceName string) (*LibSQLHandler, error) {
-	db, err := sql.Open(driverName, dataSourceName)
-	if err != nil {
-		return nil, fmt.Errorf("failed to open database: %w", err)
-	}
-
-	// Set connection limits
-	db.SetMaxOpenConns(100)
-	db.SetMaxIdleConns(10)
-	db.SetConnMaxLifetime(time.Hour)
-
+// New initializes the stateful LibSQL HTTP handler with an already open *sql.DB connection.
+// It is up to the caller to manage the lifecycle (Open/Close) of the db connection.
+func New(db *sql.DB) *LibSQLHandler {
 	h := &LibSQLHandler{
 		db:             db,
 		sessions:       make(map[string]*Session),
 		sessionTimeout: 10 * time.Minute,
+		flushChan:      make(chan struct{}, 1),
 	}
 
 	// Start background session cleaner
 	go h.cleanupIdleSessions()
+	// Start background WAL flush debouncer
+	go h.walFlushDebouncer()
 
-	return h, nil
+	return h
 }
 
-// Close closes the database connection and active sessions.
+// Close closes all active session connections and stops the flush worker.
 func (h *LibSQLHandler) Close() error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -161,7 +152,8 @@ func (h *LibSQLHandler) Close() error {
 		s.Conn.Close()
 	}
 	h.sessions = make(map[string]*Session)
-	return h.db.Close()
+	close(h.flushChan)
+	return nil
 }
 
 // generateSessionID creates a unique cryptographically secure random string.
@@ -237,6 +229,43 @@ func (h *LibSQLHandler) cleanupIdleSessions() {
 			}
 		}
 		h.mu.Unlock()
+	}
+}
+
+// walFlushDebouncer listens for query executions and runs a WAL checkpoint
+// once 1 second of complete query silence has elapsed.
+func (h *LibSQLHandler) walFlushDebouncer() {
+	var timer *time.Timer
+	var timerChan <-chan time.Time
+
+	for {
+		select {
+		case _, ok := <-h.flushChan:
+			if !ok {
+				if timer != nil {
+					timer.Stop()
+				}
+				return
+			}
+			// Reset or initialize the timer for 1 second of inactivity
+			if timer != nil {
+				timer.Stop()
+			}
+			timer = time.NewTimer(1 * time.Second)
+			timerChan = timer.C
+
+		case <-timerChan:
+			timerChan = nil
+			timer = nil
+			// 1 second of query silence has passed! Flush the WAL buffer to disk.
+			log.Println("[WAL] 1 second of query inactivity. Executing wal_checkpoint...")
+			// Using TRUNCATE checkpoint mode to flush WAL to the main .db file and shrink WAL file size.
+			if _, err := h.db.Exec("PRAGMA wal_checkpoint(TRUNCATE);"); err != nil {
+				log.Printf("[WAL] Checkpoint failed: %v", err)
+			} else {
+				log.Println("[WAL] Checkpoint succeeded. WAL buffer flushed to database file on disk.")
+			}
+		}
 	}
 }
 
@@ -324,6 +353,12 @@ func (h *LibSQLHandler) handlePostQuery(w http.ResponseWriter, r *http.Request) 
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	if err := json.NewEncoder(w).Encode(responses); err != nil {
 		log.Printf("[Error] Failed to encode response: %v", err)
+	}
+
+	// Trigger the WAL flush debouncer in a non-blocking way
+	select {
+	case h.flushChan <- struct{}{}:
+	default:
 	}
 }
 
