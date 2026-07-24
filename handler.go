@@ -308,10 +308,16 @@ func (h *LibSQLHandler) handlePostQuery(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	responses := make([]StatementResponse, len(req.Statements))
+	responses := make([]interface{}, len(req.Statements))
 	ctx := r.Context()
 
+	batchFailed := false
 	for i, stmt := range req.Statements {
+		if batchFailed {
+			responses[i] = nil
+			continue
+		}
+
 		startTime := time.Now()
 		var resp StatementResponse
 
@@ -321,7 +327,8 @@ func (h *LibSQLHandler) handlePostQuery(w http.ResponseWriter, r *http.Request) 
 			args = stmt.Params
 		} else if len(stmt.NamedParams) > 0 {
 			for k, v := range stmt.NamedParams {
-				args = append(args, sql.Named(k, v))
+				cleanKey := strings.TrimPrefix(strings.TrimPrefix(strings.TrimPrefix(k, ":"), "@"), "$")
+				args = append(args, sql.Named(cleanKey, v))
 			}
 		}
 
@@ -332,6 +339,7 @@ func (h *LibSQLHandler) handlePostQuery(w http.ResponseWriter, r *http.Request) 
 		results, err := executeSQL(ctx, s.Conn, stmt.Query, args)
 		if err != nil {
 			resp.Error = err.Error()
+			batchFailed = true
 		} else {
 			results.QueryDurationMs = float64(time.Since(startTime).Nanoseconds()) / 1e6
 			resp.Results = results
@@ -349,7 +357,8 @@ func (h *LibSQLHandler) handlePostQuery(w http.ResponseWriter, r *http.Request) 
 	}
 }
 
-// isQuery checks if the query is a SELECT, PRAGMA, WITH, EXPLAIN or other read-only queries
+// isQuery checks if the query is a SELECT, PRAGMA, WITH, EXPLAIN, SHOW, VALUES query
+// or contains a RETURNING clause.
 func isQuery(query string) bool {
 	q := strings.TrimSpace(strings.ToLower(query))
 	for {
@@ -371,7 +380,9 @@ func isQuery(query string) bool {
 		strings.HasPrefix(q, "pragma") ||
 		strings.HasPrefix(q, "with") ||
 		strings.HasPrefix(q, "explain") ||
-		strings.HasPrefix(q, "show")
+		strings.HasPrefix(q, "show") ||
+		strings.HasPrefix(q, "values") ||
+		strings.Contains(q, "returning")
 }
 
 // safeRowsAffected safely retrieves rows affected, recovering from any driver panic.

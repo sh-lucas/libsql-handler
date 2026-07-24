@@ -231,3 +231,264 @@ func TestSessionStateTransactions(t *testing.T) {
 		t.Errorf("expected committed balance 100.0, got: %v", res4[0].Results.Rows)
 	}
 }
+
+func TestBatchErrorHandlingStopOnFailure(t *testing.T) {
+	db, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatalf("failed to open database: %v", err)
+	}
+	defer db.Close()
+
+	h := New(db)
+	defer h.Close()
+
+	server := httptest.NewServer(h)
+	defer server.Close()
+
+	reqPayload := Request{
+		Statements: []Statement{
+			{Query: "SELECT 1 AS first"},
+			{Query: "SELECT * FROM non_existent_table_xyz"},
+			{Query: "SELECT 2 AS second"},
+		},
+	}
+
+	reqBytes, _ := json.Marshal(reqPayload)
+	resp, err := http.Post(server.URL, "application/json", bytes.NewReader(reqBytes))
+	if err != nil {
+		t.Fatalf("failed POST: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", resp.StatusCode)
+	}
+
+	var rawResponses []json.RawMessage
+	if err := json.NewDecoder(resp.Body).Decode(&rawResponses); err != nil {
+		t.Fatalf("failed to decode raw responses: %v", err)
+	}
+
+	if len(rawResponses) != 3 {
+		t.Fatalf("expected 3 items in response array, got %d", len(rawResponses))
+	}
+
+	// 1st statement should succeed
+	var stmt1 StatementResponse
+	if err := json.Unmarshal(rawResponses[0], &stmt1); err != nil {
+		t.Fatalf("failed unmarshaling stmt 1: %v", err)
+	}
+	if stmt1.Error != "" || len(stmt1.Results.Rows) != 1 {
+		t.Errorf("stmt 1 unexpected result: %+v", stmt1)
+	}
+
+	// 2nd statement should fail
+	var stmt2 StatementResponse
+	if err := json.Unmarshal(rawResponses[1], &stmt2); err != nil {
+		t.Fatalf("failed unmarshaling stmt 2: %v", err)
+	}
+	if stmt2.Error == "" || !strings.Contains(stmt2.Error, "no such table") {
+		t.Errorf("expected error in stmt 2, got: %q", stmt2.Error)
+	}
+
+	// 3rd statement should be null (skipped after error in batch)
+	if string(rawResponses[2]) != "null" {
+		t.Errorf("expected 3rd statement response to be null, got: %s", string(rawResponses[2]))
+	}
+}
+
+func TestReturningClauseQueries(t *testing.T) {
+	db, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatalf("failed to open database: %v", err)
+	}
+	defer db.Close()
+
+	h := New(db)
+	defer h.Close()
+
+	server := httptest.NewServer(h)
+	defer server.Close()
+
+	reqPayload := Request{
+		Statements: []Statement{
+			{Query: "CREATE TABLE items (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT)"},
+			{Query: "INSERT INTO items (name) VALUES ('widget') RETURNING id, name"},
+		},
+	}
+
+	reqBytes, _ := json.Marshal(reqPayload)
+	resp, err := http.Post(server.URL, "application/json", bytes.NewReader(reqBytes))
+	if err != nil {
+		t.Fatalf("failed POST: %v", err)
+	}
+	defer resp.Body.Close()
+
+	var results []StatementResponse
+	if err := json.NewDecoder(resp.Body).Decode(&results); err != nil {
+		t.Fatalf("failed to decode responses: %v", err)
+	}
+
+	if len(results) != 2 {
+		t.Fatalf("expected 2 responses, got %d", len(results))
+	}
+
+	retRes := results[1]
+	if retRes.Error != "" {
+		t.Fatalf("error in RETURNING query: %s", retRes.Error)
+	}
+	if len(retRes.Results.Columns) != 2 || retRes.Results.Columns[0] != "id" || retRes.Results.Columns[1] != "name" {
+		t.Errorf("unexpected RETURNING columns: %v", retRes.Results.Columns)
+	}
+	if len(retRes.Results.Rows) != 1 || retRes.Results.Rows[0][1] != "widget" {
+		t.Errorf("unexpected RETURNING rows: %v", retRes.Results.Rows)
+	}
+}
+
+func TestNamedParametersVariants(t *testing.T) {
+	db, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatalf("failed to open database: %v", err)
+	}
+	defer db.Close()
+
+	h := New(db)
+	defer h.Close()
+
+	server := httptest.NewServer(h)
+	defer server.Close()
+
+	reqPayload := Request{
+		Statements: []Statement{
+			{
+				Query: "SELECT :a AS first, @b AS second, $c AS third",
+				NamedParams: map[string]interface{}{
+					":a": 10,
+					"b":  20,
+					"$c": 30,
+				},
+			},
+		},
+	}
+
+	reqBytes, _ := json.Marshal(reqPayload)
+	resp, err := http.Post(server.URL, "application/json", bytes.NewReader(reqBytes))
+	if err != nil {
+		t.Fatalf("failed POST: %v", err)
+	}
+	defer resp.Body.Close()
+
+	var results []StatementResponse
+	if err := json.NewDecoder(resp.Body).Decode(&results); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+
+	if len(results) != 1 || results[0].Error != "" {
+		t.Fatalf("named params query failed: %v", results[0].Error)
+	}
+
+	rows := results[0].Results.Rows
+	if len(rows) != 1 {
+		t.Fatalf("expected 1 row, got %d", len(rows))
+	}
+
+	if rows[0][0].(float64) != 10 || rows[0][1].(float64) != 20 || rows[0][2].(float64) != 30 {
+		t.Errorf("unexpected named params values: %v", rows[0])
+	}
+}
+
+func TestCORSAndOptions(t *testing.T) {
+	db, _ := sql.Open("sqlite", ":memory:")
+	defer db.Close()
+	h := New(db)
+	defer h.Close()
+	server := httptest.NewServer(h)
+	defer server.Close()
+
+	req, _ := http.NewRequest(http.MethodOptions, server.URL, nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("failed OPTIONS request: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("expected 200 for OPTIONS, got %d", resp.StatusCode)
+	}
+	if resp.Header.Get("Access-Control-Allow-Origin") != "*" {
+		t.Errorf("expected Access-Control-Allow-Origin: *, got %q", resp.Header.Get("Access-Control-Allow-Origin"))
+	}
+}
+
+func TestCompareWithRealSqld(t *testing.T) {
+	sqldURL := "http://localhost:8085"
+	// Check if real sqld is available on localhost:8085
+	respCheck, err := http.Get(sqldURL + "/version")
+	if err != nil || respCheck.StatusCode != http.StatusOK {
+		t.Skip("real sqld instance not running on localhost:8085, skipping live comparative test")
+		return
+	}
+	respCheck.Body.Close()
+
+	// Setup local libsql-handler server
+	db, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatalf("failed to open database: %v", err)
+	}
+	defer db.Close()
+	h := New(db)
+	defer h.Close()
+	handlerServer := httptest.NewServer(h)
+	defer handlerServer.Close()
+
+	// Test case 1: Query output format comparison
+	queryJSON := `{"statements": ["SELECT 42 AS num, 'hello' AS msg, NULL as empty"]}`
+	
+	respHandler, err := http.Post(handlerServer.URL, "application/json", strings.NewReader(queryJSON))
+	if err != nil {
+		t.Fatalf("handler POST failed: %v", err)
+	}
+	defer respHandler.Body.Close()
+
+	respSqld, err := http.Post(sqldURL, "application/json", strings.NewReader(queryJSON))
+	if err != nil {
+		t.Fatalf("sqld POST failed: %v", err)
+	}
+	defer respSqld.Body.Close()
+
+	var handlerRes []StatementResponse
+	var sqldRes []StatementResponse
+	json.NewDecoder(respHandler.Body).Decode(&handlerRes)
+	json.NewDecoder(respSqld.Body).Decode(&sqldRes)
+
+	if len(handlerRes) != len(sqldRes) {
+		t.Errorf("response length mismatch: handler=%d, sqld=%d", len(handlerRes), len(sqldRes))
+	} else {
+		// Compare Columns
+		if len(handlerRes[0].Results.Columns) != len(sqldRes[0].Results.Columns) {
+			t.Errorf("columns length mismatch: handler=%v, sqld=%v", handlerRes[0].Results.Columns, sqldRes[0].Results.Columns)
+		}
+		// Compare Rows content
+		if len(handlerRes[0].Results.Rows) != len(sqldRes[0].Results.Rows) {
+			t.Errorf("rows length mismatch: handler=%v, sqld=%v", handlerRes[0].Results.Rows, sqldRes[0].Results.Rows)
+		}
+	}
+
+	// Test case 2: Batch failure comparison
+	batchErrJSON := `{"statements": ["SELECT 1", "SELECT * FROM missing_table_123", "SELECT 2"]}`
+	
+	respHandlerErr, _ := http.Post(handlerServer.URL, "application/json", strings.NewReader(batchErrJSON))
+	defer respHandlerErr.Body.Close()
+	respSqldErr, _ := http.Post(sqldURL, "application/json", strings.NewReader(batchErrJSON))
+	defer respSqldErr.Body.Close()
+
+	var rawHandlerErr []json.RawMessage
+	var rawSqldErr []json.RawMessage
+	json.NewDecoder(respHandlerErr.Body).Decode(&rawHandlerErr)
+	json.NewDecoder(respSqldErr.Body).Decode(&rawSqldErr)
+
+	if string(rawHandlerErr[2]) != string(rawSqldErr[2]) {
+		t.Errorf("batch failure handling mismatch on 3rd item: handler=%s, sqld=%s", string(rawHandlerErr[2]), string(rawSqldErr[2]))
+	}
+}
+
