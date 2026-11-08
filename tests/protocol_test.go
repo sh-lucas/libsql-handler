@@ -24,7 +24,7 @@ func TestVersion(t *testing.T) {
 func TestUnknownRoutes(t *testing.T) {
 	e := newEnv(t, 0)
 	for _, req := range []struct{ method, path string }{
-		{http.MethodGet, "/"}, {http.MethodPost, "/v2/pipeline"}, {http.MethodOptions, "/"},
+		{http.MethodGet, "/"}, {http.MethodPost, "/v3-protobuf/pipeline"}, {http.MethodGet, "/v3/pipeline"}, {http.MethodOptions, "/"},
 	} {
 		r, _ := http.NewRequest(req.method, e.srv.URL+req.path, nil)
 		resp, err := http.DefaultClient.Do(r)

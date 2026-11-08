@@ -20,7 +20,7 @@ import (
 )
 
 type env struct {
-	t   *testing.T
+	t   testing.TB
 	db  *sql.DB
 	h   *libsqlhandler.LibSQLHandler
 	srv *httptest.Server
@@ -28,7 +28,7 @@ type env struct {
 
 // newEnv serves a fresh file database (file, not :memory:, so every
 // connection sees the same data). maxOpen <= 0 leaves the pool unbounded.
-func newEnv(t *testing.T, maxOpen int, opts ...libsqlhandler.Option) *env {
+func newEnv(t testing.TB, maxOpen int, opts ...libsqlhandler.Option) *env {
 	t.Helper()
 	db, err := sql.Open("sqlite", filepath.Join(t.TempDir(), "test.db"))
 	if err != nil {

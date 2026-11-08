@@ -8,6 +8,7 @@ import (
 	"database/sql/driver"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"slices"
 	"sync"
@@ -27,13 +28,17 @@ var (
 	errSessionLost     = errors.New("session expired with an open transaction, which was rolled back; nothing in this request ran, retry to start a new session")
 )
 
-// session is a client's sticky connection. mu is held for the whole request,
-// so a session runs one batch at a time and is never swept while in use.
+// session is a client's sticky connection: a v1 cookie session or a Hrana
+// stream. mu is held for the whole request, so a session runs one request at
+// a time and is never swept while in use.
 type session struct {
 	mu       sync.Mutex
+	key      string    // its key in h.sessions: the cookie, or the current baton; written under mu and h.mu
 	conn     *sql.Conn // nil once discarded
 	lastUsed atomic.Int64
-	reused   atomic.Bool // the client sent the cookie back at least once
+	reused   atomic.Bool      // not one-shot: the cookie came back, or it is a Hrana stream
+	sqls     map[int32]string // Hrana store_sql texts, scoped to the stream
+	log      *slog.Logger
 }
 
 func (s *session) touch() { s.lastUsed.Store(time.Now().UnixNano()) }
@@ -48,10 +53,16 @@ func (s *session) expired(now time.Time, timeout time.Duration) bool {
 func (s *session) inTx() bool {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
+	// The probe's ROLLBACK ends a transaction, which resets this pragma.
+	var deferFK int
+	_ = s.conn.QueryRowContext(ctx, "PRAGMA defer_foreign_keys").Scan(&deferFK)
 	if _, err := s.conn.ExecContext(ctx, "BEGIN"); err != nil {
 		return true
 	}
 	_, _ = s.conn.ExecContext(ctx, "ROLLBACK")
+	if deferFK != 0 {
+		_, _ = s.conn.ExecContext(ctx, "PRAGMA defer_foreign_keys = ON")
+	}
 	return false
 }
 
@@ -83,7 +94,18 @@ func (h *LibSQLHandler) acquire(ctx context.Context, w http.ResponseWriter, r *h
 			s.mu.Unlock()
 		}
 	}
-	return h.create(ctx, w)
+	s, err := h.create(ctx)
+	if err != nil {
+		return nil, err
+	}
+	http.SetCookie(w, &http.Cookie{
+		Name:     sessionCookie,
+		Value:    s.key,
+		Path:     "/",
+		HttpOnly: true,
+		SameSite: http.SameSiteStrictMode,
+	})
+	return s, nil
 }
 
 func (h *LibSQLHandler) release(s *session) {
@@ -92,13 +114,13 @@ func (h *LibSQLHandler) release(s *session) {
 }
 
 // lookup finds a live session. If the session was dropped with a transaction
-// open, it reports errSessionLost once: running the rest of the client's
-// transaction on a fresh session would autocommit half of it.
+// open, every request still naming it gets errSessionLost (until
+// lostRetention): running the rest of the client's transaction on a fresh
+// session would autocommit half of it.
 func (h *LibSQLHandler) lookup(id string) (*session, error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if _, ok := h.lost[id]; ok {
-		delete(h.lost, id)
 		return nil, errSessionLost
 	}
 	s := h.sessions[id]
@@ -109,7 +131,6 @@ func (h *LibSQLHandler) lookup(id string) (*session, error) {
 		hadTx := h.dropLocked(id, s)
 		s.mu.Unlock()
 		if hadTx {
-			delete(h.lost, id)
 			return nil, errSessionLost
 		}
 		return nil, nil
@@ -131,7 +152,8 @@ func (h *LibSQLHandler) dropLocked(id string, s *session) (hadTx bool) {
 	return hadTx
 }
 
-func (h *LibSQLHandler) create(ctx context.Context, w http.ResponseWriter) (*session, error) {
+// create opens a session on its own pool connection and returns it locked.
+func (h *LibSQLHandler) create(ctx context.Context) (*session, error) {
 	h.mu.Lock()
 	if h.closed {
 		h.mu.Unlock()
@@ -148,7 +170,7 @@ func (h *LibSQLHandler) create(ctx context.Context, w http.ResponseWriter) (*ses
 	h.mu.Unlock()
 
 	// Wait for a pool connection without holding h.mu, so other sessions keep working.
-	s := &session{}
+	s := &session{log: h.log}
 	ctx, cancel := context.WithTimeout(ctx, acquireTimeout)
 	defer cancel()
 	conn, err := h.db.Conn(ctx)
@@ -171,18 +193,37 @@ func (h *LibSQLHandler) create(ctx context.Context, w http.ResponseWriter) (*ses
 		return nil, fmt.Errorf("allocating connection: %w", err)
 	}
 
-	id := rand.Text()
+	s.key = rand.Text()
 	s.touch()
 	s.mu.Lock()
-	h.sessions[id] = s
-	http.SetCookie(w, &http.Cookie{
-		Name:     sessionCookie,
-		Value:    id,
-		Path:     "/",
-		HttpOnly: true,
-		SameSite: http.SameSiteStrictMode,
-	})
+	h.sessions[s.key] = s
 	return s, nil
+}
+
+// rekey moves a session to a fresh random key and returns it, or nil if the
+// session is no longer registered (the handler closed). Caller holds s.mu.
+func (h *LibSQLHandler) rekey(s *session) *string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.sessions[s.key] != s {
+		return nil
+	}
+	delete(h.sessions, s.key)
+	s.key = rand.Text()
+	h.sessions[s.key] = s
+	key := s.key
+	return &key
+}
+
+// closeSession unregisters and discards a session, rolling back any open
+// transaction. Caller holds s.mu.
+func (h *LibSQLHandler) closeSession(s *session) {
+	h.mu.Lock()
+	if h.sessions[s.key] == s {
+		delete(h.sessions, s.key)
+	}
+	h.mu.Unlock()
+	s.discard()
 }
 
 // sessionLimit keeps one pool connection free for the WAL checkpoint and any

@@ -1,4 +1,4 @@
-// Command server serves a local SQLite file to DBeaver's LibSQL driver.
+// Command server serves a local SQLite file to libSQL clients and DBeaver.
 package main
 
 import (
@@ -68,12 +68,14 @@ func run(addr, dbPath string, log *slog.Logger) error {
 		grace, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		_ = srv.Shutdown(grace)
-		// Past the grace period: interrupt remaining queries, then drop their connections.
-		_ = h.Close()
+		// Past the grace period: drop connections first, so a handler blocked
+		// writing to a client that stopped reading returns, then interrupt
+		// remaining queries and roll back sessions.
 		_ = srv.Close()
+		_ = h.Close()
 	}()
 
-	fmt.Fprintf(os.Stderr, "Serving %s on http://%s\nDBeaver: New Connection -> LibSQL -> URL http://%s (no token)\n", dbPath, addr, addr)
+	fmt.Fprintf(os.Stderr, "Serving %s on http://%s (libSQL clients: url http://%s, no token; DBeaver: LibSQL connection, same URL)\n", dbPath, addr, addr)
 	if err := srv.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
 		return err
 	}

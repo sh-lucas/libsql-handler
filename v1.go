@@ -8,10 +8,63 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math"
+	"net/http"
 	"strings"
 	"time"
 )
+
+// The legacy v1 API (docs: libsql/docs/HTTP_V1_SPEC.md), still the only one
+// DBeaver's LibSQL JDBC driver speaks. Its sessions are kept by a cookie.
+
+// serveV1 runs a v1 batch on the client's cookie session.
+func (h *LibSQLHandler) serveV1(w http.ResponseWriter, r *http.Request) {
+	if !sameOrigin(w, r, writeError) {
+		return
+	}
+	// Read the body before entering, so Close never waits on a slow client.
+	var req request
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+		return
+	}
+	ctx, done, ok := h.enter(w, r, writeError)
+	if !ok {
+		return
+	}
+	defer done()
+
+	s, err := h.acquire(ctx, w, r)
+	if err != nil {
+		status := http.StatusServiceUnavailable
+		if errors.Is(err, errSessionLost) {
+			status = http.StatusConflict
+			// Drop the cookie so the client's next request starts fresh, while
+			// any other request still carrying it keeps getting 409.
+			http.SetCookie(w, &http.Cookie{Name: sessionCookie, Path: "/", MaxAge: -1})
+		}
+		writeError(w, status, err.Error())
+		return
+	}
+	results := runBatch(ctx, h.log, s.conn, req.Statements)
+	h.release(s)
+
+	body, err := json.Marshal(results)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "encoding response: "+err.Error())
+		return
+	}
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	_, _ = w.Write(body)
+}
+
+// writeError replies with a JSON body the DBeaver driver surfaces as the SQL error.
+func writeError(w http.ResponseWriter, status int, msg string) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(map[string]string{"error": msg})
+}
 
 // request is the v1 body: {"statements": ["SELECT 1", {"q": "...", "params": [...] | {...}}]}.
 type request struct {
@@ -116,10 +169,10 @@ type statementResult struct {
 
 // runBatch executes statements in order. Like sqld, it stops at the first
 // error and reports null for the statements it skipped.
-func (h *LibSQLHandler) runBatch(ctx context.Context, conn *sql.Conn, stmts []statement) []*statementResult {
+func runBatch(ctx context.Context, log *slog.Logger, conn *sql.Conn, stmts []statement) []*statementResult {
 	out := make([]*statementResult, len(stmts))
 	for i, st := range stmts {
-		h.log.Debug("executing", "sql", st.query)
+		log.Debug("executing", "sql", st.query)
 		res, err := execute(ctx, conn, st)
 		if err != nil {
 			out[i] = &statementResult{Error: err.Error()}
@@ -207,10 +260,16 @@ func jsonValue(v any) any {
 			return nil // not representable in JSON
 		}
 	case time.Time:
-		if _, offset := x.Zone(); offset == 0 {
-			return x.Format(sqliteTime)
-		}
-		return x.Format(sqliteTime + "-07:00")
+		return formatTime(x)
 	}
 	return v
+}
+
+// formatTime renders a time the driver parsed from a DATE/DATETIME/TIMESTAMP
+// column back in SQLite's format.
+func formatTime(t time.Time) string {
+	if _, offset := t.Zone(); offset == 0 {
+		return t.Format(sqliteTime)
+	}
+	return t.Format(sqliteTime + "-07:00")
 }

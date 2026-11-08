@@ -1,0 +1,11 @@
+{
+  "name": "libsql-handler-client-tests",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test"
+  },
+  "dependencies": {
+    "@libsql/client": "0.18.0"
+  }
+}

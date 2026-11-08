@@ -1,16 +1,15 @@
-// Package libsqlhandler serves a SQLite *sql.DB over the libSQL (sqld) v1 HTTP
-// protocol, the one spoken by DBeaver's LibSQL JDBC driver.
+// Package libsqlhandler serves a SQLite *sql.DB over the libSQL (sqld) HTTP
+// protocols: Hrana over HTTP (v2 and v3, JSON), spoken by the official libSQL
+// clients, and the legacy v1 API spoken by DBeaver's LibSQL JDBC driver.
 //
-// Each client gets a sticky session (via a "session" cookie) pinned to its own
-// connection, so BEGIN/COMMIT spanning several requests behave like they would
-// on a local connection.
+// Each Hrana stream, and each v1 client (via a "session" cookie), is pinned
+// to its own connection, so transactions spanning several requests behave
+// like they would on a local connection.
 package libsqlhandler
 
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
-	"errors"
 	"log/slog"
 	"net/http"
 	"sync"
@@ -26,7 +25,7 @@ const (
 	checkpointDelay = time.Second
 )
 
-// LibSQLHandler is an http.Handler serving the libSQL v1 HTTP protocol.
+// LibSQLHandler is an http.Handler serving the libSQL HTTP protocols.
 type LibSQLHandler struct {
 	db             *sql.DB
 	log            *slog.Logger
@@ -136,13 +135,20 @@ func (h *LibSQLHandler) Close() error {
 
 // ServeHTTP implements http.Handler.
 func (h *LibSQLHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	switch {
-	case r.Method == http.MethodGet && r.URL.Path == "/version":
+	switch r.Method + " " + r.URL.Path {
+	case "GET /version":
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		// Must match VERSION_PATTERN "(\\w+)\\s+([0-9.]+)\\s+(.+)" in the DBeaver driver.
 		_, _ = w.Write([]byte("sqld 0.20.0 main\n"))
-	case r.Method == http.MethodPost && (r.URL.Path == "/" || r.URL.Path == ""):
-		h.handleQuery(w, r)
+	case "POST /", "POST ":
+		h.serveV1(w, r)
+	case "GET /v2", "GET /v3":
+		// Hrana version probes. No /v3-protobuf: clients then fall back to JSON.
+		w.WriteHeader(http.StatusOK)
+	case "POST /v2/pipeline", "POST /v3/pipeline":
+		h.serveHranaPipeline(w, r)
+	case "POST /v3/cursor":
+		h.serveHranaCursor(w, r)
 	default:
 		http.Error(w, "Not Found", http.StatusNotFound)
 	}
@@ -153,63 +159,40 @@ func (h *LibSQLHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // neither Origin nor Sec-Fetch-Site and pass.
 var crossOrigin = http.NewCrossOriginProtection()
 
-func (h *LibSQLHandler) handleQuery(w http.ResponseWriter, r *http.Request) {
+// sameOrigin rejects cross-origin browser requests, before their body is read.
+func sameOrigin(w http.ResponseWriter, r *http.Request, fail func(http.ResponseWriter, int, string)) bool {
 	if err := crossOrigin.Check(r); err != nil {
-		writeError(w, http.StatusForbidden, err.Error())
-		return
+		fail(w, http.StatusForbidden, err.Error())
+		return false
 	}
+	return true
+}
+
+// enter admits a request, rejecting requests after Close. Call it once the
+// body is read, so Close never waits on a slow client. The returned context
+// is canceled when the client goes away or the handler closes; done must be
+// called when finished.
+func (h *LibSQLHandler) enter(w http.ResponseWriter, r *http.Request, fail func(http.ResponseWriter, int, string)) (context.Context, func(), bool) {
 	h.mu.Lock()
 	if h.closed {
 		h.mu.Unlock()
-		writeError(w, http.StatusServiceUnavailable, errClosed.Error())
-		return
+		fail(w, http.StatusServiceUnavailable, errClosed.Error())
+		return nil, nil, false
 	}
 	h.requests.Add(1)
 	h.mu.Unlock()
-	defer h.requests.Done()
 
-	// Canceled when the client goes away or the handler closes.
 	ctx, cancel := context.WithCancel(r.Context())
-	defer cancel()
-	defer context.AfterFunc(h.ctx, cancel)()
-
-	var req request
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
-		return
-	}
-
-	s, err := h.acquire(ctx, w, r)
-	if err != nil {
-		status := http.StatusServiceUnavailable
-		if errors.Is(err, errSessionLost) {
-			status = http.StatusConflict
+	stop := context.AfterFunc(h.ctx, cancel)
+	return ctx, func() {
+		stop()
+		cancel()
+		h.requests.Done()
+		select {
+		case h.checkpoint <- struct{}{}:
+		default:
 		}
-		writeError(w, status, err.Error())
-		return
-	}
-	results := h.runBatch(ctx, s.conn, req.Statements)
-	h.release(s)
-
-	body, err := json.Marshal(results)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "encoding response: "+err.Error())
-		return
-	}
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	_, _ = w.Write(body)
-
-	select {
-	case h.checkpoint <- struct{}{}:
-	default:
-	}
-}
-
-// writeError replies with a JSON body the DBeaver driver surfaces as the SQL error.
-func writeError(w http.ResponseWriter, status int, msg string) {
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(map[string]string{"error": msg})
+	}, true
 }
 
 // checkpointWAL folds the WAL back into the main db file after
