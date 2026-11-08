@@ -12,6 +12,7 @@ import (
 	"database/sql"
 	"log/slog"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 )
@@ -135,12 +136,17 @@ func (h *LibSQLHandler) Close() error {
 
 // ServeHTTP implements http.Handler.
 func (h *LibSQLHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	switch r.Method + " " + r.URL.Path {
+	path := r.URL.Path
+	if !strings.HasPrefix(path, "/") {
+		// Tolerate http.StripPrefix("/prefix/", h), which leaves "v3/pipeline" or "".
+		path = "/" + path
+	}
+	switch r.Method + " " + path {
 	case "GET /version":
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		// Must match VERSION_PATTERN "(\\w+)\\s+([0-9.]+)\\s+(.+)" in the DBeaver driver.
 		_, _ = w.Write([]byte("sqld 0.20.0 main\n"))
-	case "POST /", "POST ":
+	case "POST /":
 		h.serveV1(w, r)
 	case "GET /v2", "GET /v3":
 		// Hrana version probes. No /v3-protobuf: clients then fall back to JSON.

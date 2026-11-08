@@ -17,6 +17,11 @@ defer h.Close()
 http.ListenAndServe("127.0.0.1:8080", h)
 ```
 
+To mount it under a path, use `http.StripPrefix` (with or without the trailing
+slash): `mux.Handle("/libsql/", http.StripPrefix("/libsql", h))`. Give
+`@libsql/client` the URL with a trailing slash (`http://host/libsql/`): it
+resolves its endpoints relative to the URL and would drop `libsql` otherwise.
+
 Or run the bundled server: `just run -db data/app.db -v`, then point a client at
 `http://127.0.0.1:8080` (no auth token), e.g. `createClient({ url: "http://127.0.0.1:8080" })`,
 or create a LibSQL connection in DBeaver with that URL.
