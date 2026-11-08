@@ -1,11 +1,20 @@
+// Command server serves a local SQLite file to DBeaver's LibSQL driver.
 package main
 
 import (
+	"context"
 	"database/sql"
+	"errors"
 	"flag"
 	"fmt"
-	"log"
+	"log/slog"
+	"net"
 	"net/http"
+	"os"
+	"os/signal"
+	"path/filepath"
+	"strings"
+	"syscall"
 	"time"
 
 	libsqlhandler "github.com/sh-lucas/libsql-handler"
@@ -14,58 +23,87 @@ import (
 )
 
 func main() {
-	port := flag.Int("port", 8080, "Port to run the HTTP server on")
-	dbPath := flag.String("db", "data/local.db", "SQLite database file path")
+	addr := flag.String("addr", "127.0.0.1:8080", "listen address; anyone who can reach it gets full SQL access")
+	dbPath := flag.String("db", "data/local.db", "SQLite database file")
+	verbose := flag.Bool("v", false, "log every executed statement")
 	flag.Parse()
 
-	log.Printf("Opening SQLite database file using pure Go driver: %s...", *dbPath)
-
-	db, err := sql.Open("sqlite", *dbPath)
-	if err != nil {
-		log.Fatalf("Failed to open database: %v", err)
+	level := slog.LevelInfo
+	if *verbose {
+		level = slog.LevelDebug
 	}
-
-	// Configure standard connection pool settings
-	db.SetMaxOpenConns(100)
-	db.SetMaxIdleConns(10)
-	db.SetConnMaxLifetime(time.Hour)
-
-	// Create and initialize the LibSQLHandler using dependency injection
-	h := libsqlhandler.New(db)
-	defer h.Close()
-	defer db.Close()
-
-	// Print beautiful connection details for DBeaver
-	fmt.Printf(`
-================================================================================
-  LibSQL Go Handler started successfully!
-================================================================================
-
-  How to connect to this server from DBeaver:
-
-  1. Open DBeaver and go to "Database" -> "New Database Connection".
-  2. Search and select the "LibSQL" driver (included by default).
-  3. Configure the connection settings:
-     - URL: http://localhost:%d
-     - Host: localhost
-     - Port: %d
-     - Username: (leave empty)
-     - Password: (leave empty, or any token)
-  4. Test the connection! It will connect to your local SQLite file: %s
-
-================================================================================
-`, *port, *port, *dbPath)
-
-	// Start the HTTP server with our handler
-	serverAddr := fmt.Sprintf(":%d", *port)
-	log.Printf("Starting HTTP server on %s...", serverAddr)
-	if err := http.ListenAndServe(serverAddr, h); err != nil {
-		if err != http.ErrServerClosed {
-			log.Fatalf("Server failed to start: %v", err)
-		}
+	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
+	if err := run(*addr, *dbPath, log); err != nil {
+		log.Error("server failed", "err", err)
+		os.Exit(1)
 	}
 }
 
-func init() {
-	log.SetFlags(log.LstdFlags | log.Lshortfile)
+func run(addr, dbPath string, log *slog.Logger) error {
+	if err := os.MkdirAll(filepath.Dir(dbPath), 0o755); err != nil {
+		return err
+	}
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(100)
+
+	h := libsqlhandler.New(db, libsqlhandler.WithLogger(log))
+	defer h.Close()
+
+	var handler http.Handler = h
+	if isLoopback(addr) {
+		handler = loopbackHostOnly(h)
+	}
+	srv := &http.Server{Addr: addr, Handler: handler, ReadHeaderTimeout: 10 * time.Second}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	shutdownDone := make(chan struct{})
+	go func() {
+		defer close(shutdownDone)
+		<-ctx.Done()
+		grace, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(grace)
+		// Past the grace period: interrupt remaining queries, then drop their connections.
+		_ = h.Close()
+		_ = srv.Close()
+	}()
+
+	fmt.Fprintf(os.Stderr, "Serving %s on http://%s\nDBeaver: New Connection -> LibSQL -> URL http://%s (no token)\n", dbPath, addr, addr)
+	if err := srv.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
+		return err
+	}
+	<-shutdownDone
+	return nil
+}
+
+// isLoopback reports whether a "host" or "host:port" names this machine only.
+func isLoopback(hostport string) bool {
+	host := hostport
+	if h, _, err := net.SplitHostPort(hostport); err == nil {
+		host = h
+	}
+	host = strings.Trim(host, "[]")
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+// loopbackHostOnly blocks DNS rebinding: a web page on evil.example whose
+// name resolves to 127.0.0.1 is same-origin to the browser, but still sends
+// Host: evil.example.
+func loopbackHostOnly(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !isLoopback(r.Host) {
+			http.Error(w, "Forbidden host", http.StatusForbidden)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }

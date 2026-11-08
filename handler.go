@@ -1,471 +1,236 @@
+// Package libsqlhandler serves a SQLite *sql.DB over the libSQL (sqld) v1 HTTP
+// protocol, the one spoken by DBeaver's LibSQL JDBC driver.
+//
+// Each client gets a sticky session (via a "session" cookie) pinned to its own
+// connection, so BEGIN/COMMIT spanning several requests behave like they would
+// on a local connection.
 package libsqlhandler
 
 import (
 	"context"
-	"crypto/rand"
 	"database/sql"
-	"encoding/hex"
 	"encoding/json"
-	"fmt"
+	"errors"
+	"log/slog"
 	"net/http"
-	"strings"
 	"sync"
 	"time"
 )
 
-// Statement represents a SQL query with optional parameters.
-// It implements a custom JSON unmarshaler to support both simple strings
-// and structured parameter objects sent by DBeaver.
-type Statement struct {
-	Query       string
-	Params      []interface{}
-	NamedParams map[string]interface{}
-}
+const (
+	defaultSessionTimeout = 10 * time.Minute
+	defaultMaxSessions    = 64
+	// acquireTimeout bounds every wait for a pool connection, so a saturated
+	// pool turns into a 503 instead of a hung request.
+	acquireTimeout  = 5 * time.Second
+	checkpointDelay = time.Second
+)
 
-// MarshalJSON implements json.Marshaler.
-func (s Statement) MarshalJSON() ([]byte, error) {
-	// If no parameters, serialize as a plain string to match DBeaver's optimized format
-	if len(s.Params) == 0 && len(s.NamedParams) == 0 {
-		return json.Marshal(s.Query)
-	}
-
-	// Otherwise, serialize as an object with "q" and "params"
-	var params interface{}
-	if len(s.Params) > 0 {
-		params = s.Params
-	} else if len(s.NamedParams) > 0 {
-		params = s.NamedParams
-	}
-
-	return json.Marshal(struct {
-		Q      string      `json:"q"`
-		Params interface{} `json:"params"`
-	}{
-		Q:      s.Query,
-		Params: params,
-	})
-}
-
-// UnmarshalJSON implements json.Unmarshaler.
-func (s *Statement) UnmarshalJSON(data []byte) error {
-	// 1. Try parsing as a plain JSON string (simple query)
-	var str string
-	if err := json.Unmarshal(data, &str); err == nil {
-		s.Query = str
-		return nil
-	}
-
-	// 2. Try parsing as a structured query object
-	var obj struct {
-		Q      string          `json:"q"`
-		Params json.RawMessage `json:"params"`
-	}
-	if err := json.Unmarshal(data, &obj); err != nil {
-		return err
-	}
-	s.Query = obj.Q
-
-	if len(obj.Params) > 0 {
-		// Determine if params is a JSON array [] or object {}
-		trimmed := strings.TrimSpace(string(obj.Params))
-		if len(trimmed) > 0 {
-			if trimmed[0] == '[' {
-				var list []interface{}
-				if err := json.Unmarshal(obj.Params, &list); err != nil {
-					return fmt.Errorf("failed to parse positional params: %w", err)
-				}
-				s.Params = list
-			} else if trimmed[0] == '{' {
-				var m map[string]interface{}
-				if err := json.Unmarshal(obj.Params, &m); err != nil {
-					return fmt.Errorf("failed to parse named params: %w", err)
-				}
-				s.NamedParams = m
-			}
-		}
-	}
-	return nil
-}
-
-// Request represents the incoming HTTP POST batch query request.
-type Request struct {
-	Statements []Statement `json:"statements"`
-}
-
-// Results represents the data shape returned for a single SQL statement execution.
-type Results struct {
-	Columns         []string        `json:"columns"`
-	Rows            [][]interface{} `json:"rows"`
-	RowsRead        int64           `json:"rows_read"`
-	RowsWritten     int64           `json:"rows_written"`
-	QueryDurationMs float64         `json:"query_duration_ms"`
-}
-
-// StatementResponse represents the payload wrapped for each SQL statement execution.
-type StatementResponse struct {
-	Results *Results `json:"results,omitempty"`
-	Error   string   `json:"error,omitempty"`
-}
-
-// Session represents a persistent, sticky SQLite connection associated with a client cookie.
-type Session struct {
-	ID       string
-	Conn     *sql.Conn
-	LastUsed time.Time
-	Mutex    sync.Mutex
-}
-
-// LibSQLHandler serves HTTP requests matching DBeaver JDBC client protocol.
+// LibSQLHandler is an http.Handler serving the libSQL v1 HTTP protocol.
 type LibSQLHandler struct {
 	db             *sql.DB
-	sessions       map[string]*Session
-	mu             sync.RWMutex
+	log            *slog.Logger
 	sessionTimeout time.Duration
-	flushChan      chan struct{}
+	maxSessions    int
+
+	mu       sync.Mutex
+	sessions map[string]*session
+	lost     map[string]time.Time // sessions dropped with an open transaction
+	pending  int                  // sessions being created, counted against the limit
+	closed   bool
+	requests sync.WaitGroup // in-flight queries, awaited by Close
+
+	checkpoint chan struct{}
+	ctx        context.Context // canceled by Close
+	cancel     context.CancelFunc
+	wg         sync.WaitGroup
+	closeOnce  sync.Once
 }
 
-// New initializes the stateful LibSQL HTTP handler with an already open *sql.DB connection.
-// It is up to the caller to manage the lifecycle (Open/Close) of the db connection.
-func New(db *sql.DB) *LibSQLHandler {
+// Option configures a LibSQLHandler.
+type Option func(*LibSQLHandler)
+
+// WithSessionTimeout sets how long an idle session (and any transaction it has
+// open) is kept before it is rolled back and dropped. Default: 10 minutes.
+func WithSessionTimeout(d time.Duration) Option {
+	return func(h *LibSQLHandler) {
+		if d > 0 {
+			h.sessionTimeout = d
+		}
+	}
+}
+
+// WithMaxSessions caps concurrent sessions. Each session pins one pool
+// connection, so the effective cap is also bounded by db.SetMaxOpenConns.
+// Default: 64.
+func WithMaxSessions(n int) Option {
+	return func(h *LibSQLHandler) {
+		if n > 0 {
+			h.maxSessions = n
+		}
+	}
+}
+
+// WithLogger sets the logger. Executed SQL is logged at debug level.
+// Default: logs are discarded.
+func WithLogger(l *slog.Logger) Option {
+	return func(h *LibSQLHandler) {
+		if l != nil {
+			h.log = l
+		}
+	}
+}
+
+// New creates a handler over an already open db. The caller owns db and must
+// close it after Close.
+func New(db *sql.DB, opts ...Option) *LibSQLHandler {
 	h := &LibSQLHandler{
 		db:             db,
-		sessions:       make(map[string]*Session),
-		sessionTimeout: 10 * time.Minute,
-		flushChan:      make(chan struct{}, 1),
+		log:            slog.New(slog.DiscardHandler),
+		sessionTimeout: defaultSessionTimeout,
+		maxSessions:    defaultMaxSessions,
+		sessions:       make(map[string]*session),
+		lost:           make(map[string]time.Time),
+		checkpoint:     make(chan struct{}, 1),
 	}
+	for _, opt := range opts {
+		opt(h)
+	}
+	h.ctx, h.cancel = context.WithCancel(context.Background())
 
-	// Start background session cleaner
-	go h.cleanupIdleSessions()
-	// Start background WAL flush debouncer
-	go h.walFlushDebouncer()
+	// WAL lets other sessions keep reading while one holds a write transaction.
+	ctx, cancel := context.WithTimeout(h.ctx, acquireTimeout)
+	if _, err := db.ExecContext(ctx, "PRAGMA journal_mode = WAL"); err != nil {
+		h.log.Warn("enabling WAL failed", "err", err)
+	}
+	cancel()
 
+	h.wg.Add(2)
+	go h.sweepSessions()
+	go h.checkpointWAL()
 	return h
 }
 
-// Close closes all active session connections and stops the flush worker.
+// Close interrupts in-flight queries, rolls back and closes every session,
+// and stops background work, returning once all of it has finished. Safe to
+// call more than once; requests arriving afterwards get 503.
 func (h *LibSQLHandler) Close() error {
-	h.mu.Lock()
-	defer h.mu.Unlock()
+	h.closeOnce.Do(func() {
+		h.mu.Lock()
+		h.closed = true
+		sessions := h.sessions
+		h.sessions = make(map[string]*session)
+		h.mu.Unlock()
 
-	for _, s := range h.sessions {
-		s.Conn.Close()
-	}
-	h.sessions = make(map[string]*Session)
-	close(h.flushChan)
+		h.cancel() // interrupts running queries and pending connection waits
+		for _, s := range sessions {
+			s.mu.Lock()
+			s.discard()
+			s.mu.Unlock()
+		}
+		h.requests.Wait()
+		h.wg.Wait()
+	})
 	return nil
 }
 
-// generateSessionID creates a unique cryptographically secure random string.
-func generateSessionID() string {
-	b := make([]byte, 16)
-	if _, err := rand.Read(b); err != nil {
-		return fmt.Sprintf("sess_%d", time.Now().UnixNano())
-	}
-	return hex.EncodeToString(b)
-}
-
-// getOrCreateSession retrieves an existing session from the "session" cookie,
-// or creates a new one with a dedicated database connection.
-func (h *LibSQLHandler) getOrCreateSession(w http.ResponseWriter, r *http.Request) (*Session, error) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-
-	var sessionID string
-	cookie, err := r.Cookie("session")
-	if err == nil {
-		sessionID = cookie.Value
-		if s, ok := h.sessions[sessionID]; ok {
-			s.LastUsed = time.Now()
-			return s, nil
-		}
-	}
-
-	// Create a new session if none exists or it has expired
-	sessionID = generateSessionID()
-	ctx := context.Background()
-	conn, err := h.db.Conn(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("failed to allocate dedicated connection: %w", err)
-	}
-
-	// Configure connection-scoped pragmas for SQLite
-	_, _ = conn.ExecContext(ctx, "PRAGMA journal_mode = WAL")
-	_, _ = conn.ExecContext(ctx, "PRAGMA busy_timeout = 5000")
-
-	s := &Session{
-		ID:       sessionID,
-		Conn:     conn,
-		LastUsed: time.Now(),
-	}
-	h.sessions[sessionID] = s
-
-	// Set the session cookie.
-	// Since DBeaver client has a CookieManager, it will automatically
-	// preserve and send this cookie back to keep session stickiness!
-	http.SetCookie(w, &http.Cookie{
-		Name:     "session",
-		Value:    sessionID,
-		Path:     "/",
-		HttpOnly: true,
-		SameSite: http.SameSiteLaxMode,
-	})
-
-	return s, nil
-}
-
-// cleanupIdleSessions periodically purges sessions that have exceeded h.sessionTimeout.
-func (h *LibSQLHandler) cleanupIdleSessions() {
-	ticker := time.NewTicker(1 * time.Minute)
-	for range ticker.C {
-		h.mu.Lock()
-		now := time.Now()
-		for id, s := range h.sessions {
-			if now.Sub(s.LastUsed) > h.sessionTimeout {
-				s.Conn.Close()
-				delete(h.sessions, id)
-			}
-		}
-		h.mu.Unlock()
-	}
-}
-
-// walFlushDebouncer listens for query executions and runs a WAL checkpoint
-// once 1 second of complete query silence has elapsed.
-func (h *LibSQLHandler) walFlushDebouncer() {
-	var timer *time.Timer
-	var timerChan <-chan time.Time
-
-	for {
-		select {
-		case _, ok := <-h.flushChan:
-			if !ok {
-				if timer != nil {
-					timer.Stop()
-				}
-				return
-			}
-			// Reset or initialize the timer for 1 second of inactivity
-			if timer != nil {
-				timer.Stop()
-			}
-			timer = time.NewTimer(1 * time.Second)
-			timerChan = timer.C
-
-		case <-timerChan:
-			timerChan = nil
-			timer = nil
-			// 1 second of query silence has passed! Flush the WAL buffer to disk.
-			// Using TRUNCATE checkpoint mode to flush WAL to the main .db file and shrink WAL file size.
-			_, _ = h.db.Exec("PRAGMA wal_checkpoint(TRUNCATE);")
-		}
-	}
-}
-
-// ServeHTTP routes and processes HTTP requests.
+// ServeHTTP implements http.Handler.
 func (h *LibSQLHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	// Enable CORS
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-	w.Header().Set("Access-Control-Allow-Headers", "*")
-	w.Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
-
-	if r.Method == http.MethodOptions {
-		w.WriteHeader(http.StatusOK)
-		return
-	}
-
-	// Route: GET /version
-	if r.Method == http.MethodGet && r.URL.Path == "/version" {
+	switch {
+	case r.Method == http.MethodGet && r.URL.Path == "/version":
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		// Must match VERSION_PATTERN "(\\w+)\\s+([0-9.]+)\\s+(.+)" in DBeaver driver
-		w.Write([]byte("sqld 0.20.0 main\n"))
-		return
+		// Must match VERSION_PATTERN "(\\w+)\\s+([0-9.]+)\\s+(.+)" in the DBeaver driver.
+		_, _ = w.Write([]byte("sqld 0.20.0 main\n"))
+	case r.Method == http.MethodPost && (r.URL.Path == "/" || r.URL.Path == ""):
+		h.handleQuery(w, r)
+	default:
+		http.Error(w, "Not Found", http.StatusNotFound)
 	}
-
-	// Route: POST /
-	if r.Method == http.MethodPost && (r.URL.Path == "/" || r.URL.Path == "") {
-		h.handlePostQuery(w, r)
-		return
-	}
-
-	http.Error(w, "Not Found", http.StatusNotFound)
 }
 
-func (h *LibSQLHandler) handlePostQuery(w http.ResponseWriter, r *http.Request) {
-	s, err := h.getOrCreateSession(w, r)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+// crossOrigin rejects browser requests from other origins, including
+// preflight-free text/plain POSTs. Non-browser clients like DBeaver send
+// neither Origin nor Sec-Fetch-Site and pass.
+var crossOrigin = http.NewCrossOriginProtection()
+
+func (h *LibSQLHandler) handleQuery(w http.ResponseWriter, r *http.Request) {
+	if err := crossOrigin.Check(r); err != nil {
+		writeError(w, http.StatusForbidden, err.Error())
 		return
 	}
+	h.mu.Lock()
+	if h.closed {
+		h.mu.Unlock()
+		writeError(w, http.StatusServiceUnavailable, errClosed.Error())
+		return
+	}
+	h.requests.Add(1)
+	h.mu.Unlock()
+	defer h.requests.Done()
 
-	// Lock the session connection so that multiple statements in a single batch
-	// or concurrent requests from the same session execute sequentially.
-	s.Mutex.Lock()
-	defer s.Mutex.Unlock()
+	// Canceled when the client goes away or the handler closes.
+	ctx, cancel := context.WithCancel(r.Context())
+	defer cancel()
+	defer context.AfterFunc(h.ctx, cancel)()
 
-	var req Request
+	var req request
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "Invalid JSON body", http.StatusBadRequest)
+		writeError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
 		return
 	}
 
-	responses := make([]interface{}, len(req.Statements))
-	ctx := r.Context()
-
-	batchFailed := false
-	for i, stmt := range req.Statements {
-		if batchFailed {
-			responses[i] = nil
-			continue
+	s, err := h.acquire(ctx, w, r)
+	if err != nil {
+		status := http.StatusServiceUnavailable
+		if errors.Is(err, errSessionLost) {
+			status = http.StatusConflict
 		}
-
-		startTime := time.Now()
-		var resp StatementResponse
-
-		// Bind parameters (positional or named)
-		var args []interface{}
-		if len(stmt.Params) > 0 {
-			args = stmt.Params
-		} else if len(stmt.NamedParams) > 0 {
-			for k, v := range stmt.NamedParams {
-				cleanKey := strings.TrimPrefix(strings.TrimPrefix(strings.TrimPrefix(k, ":"), "@"), "$")
-				args = append(args, sql.Named(cleanKey, v))
-			}
-		}
-
-		// Print only the executed SQL queries in bold blue color to the terminal
-		fmt.Printf("\033[1;34m%s\033[0m\n", stmt.Query)
-
-		// Execute statement
-		results, err := executeSQL(ctx, s.Conn, stmt.Query, args)
-		if err != nil {
-			resp.Error = err.Error()
-			batchFailed = true
-		} else {
-			results.QueryDurationMs = float64(time.Since(startTime).Nanoseconds()) / 1e6
-			resp.Results = results
-		}
-		responses[i] = resp
+		writeError(w, status, err.Error())
+		return
 	}
+	results := h.runBatch(ctx, s.conn, req.Statements)
+	h.release(s)
 
+	body, err := json.Marshal(results)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "encoding response: "+err.Error())
+		return
+	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	_ = json.NewEncoder(w).Encode(responses)
+	_, _ = w.Write(body)
 
-	// Trigger the WAL flush debouncer in a non-blocking way
 	select {
-	case h.flushChan <- struct{}{}:
+	case h.checkpoint <- struct{}{}:
 	default:
 	}
 }
 
-// isQuery checks if the query is a SELECT, PRAGMA, WITH, EXPLAIN, SHOW, VALUES query
-// or contains a RETURNING clause.
-func isQuery(query string) bool {
-	q := strings.TrimSpace(strings.ToLower(query))
+// writeError replies with a JSON body the DBeaver driver surfaces as the SQL error.
+func writeError(w http.ResponseWriter, status int, msg string) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(map[string]string{"error": msg})
+}
+
+// checkpointWAL folds the WAL back into the main db file after
+// checkpointDelay of silence, keeping the -wal file from growing unbounded.
+func (h *LibSQLHandler) checkpointWAL() {
+	defer h.wg.Done()
+	timer := time.NewTimer(checkpointDelay)
+	timer.Stop()
+	defer timer.Stop()
+
 	for {
-		if strings.HasPrefix(q, "--") {
-			if idx := strings.Index(q, "\n"); idx != -1 {
-				q = strings.TrimSpace(q[idx:])
-				continue
-			}
+		select {
+		case <-h.ctx.Done():
+			return
+		case <-h.checkpoint:
+			timer.Reset(checkpointDelay)
+		case <-timer.C:
+			ctx, cancel := context.WithTimeout(h.ctx, acquireTimeout)
+			// Fails with SQLITE_BUSY while a session holds a transaction; the next quiet period retries.
+			_, _ = h.db.ExecContext(ctx, "PRAGMA wal_checkpoint(TRUNCATE)")
+			cancel()
 		}
-		if strings.HasPrefix(q, "/*") {
-			if idx := strings.Index(q, "*/"); idx != -1 {
-				q = strings.TrimSpace(q[idx+2:])
-				continue
-			}
-		}
-		break
 	}
-	return strings.HasPrefix(q, "select") ||
-		strings.HasPrefix(q, "pragma") ||
-		strings.HasPrefix(q, "with") ||
-		strings.HasPrefix(q, "explain") ||
-		strings.HasPrefix(q, "show") ||
-		strings.HasPrefix(q, "values") ||
-		strings.Contains(q, "returning")
 }
-
-// safeRowsAffected safely retrieves rows affected, recovering from any driver panic.
-func safeRowsAffected(res sql.Result) int64 {
-	if res == nil {
-		return 0
-	}
-	defer func() {
-		_ = recover()
-	}()
-	n, err := res.RowsAffected()
-	if err != nil {
-		return 0
-	}
-	return n
-}
-
-// executeSQL runs a SQL statement on a dedicated connection.
-// It uses either QueryContext or ExecContext based on the statement type.
-func executeSQL(ctx context.Context, conn *sql.Conn, query string, args []interface{}) (*Results, error) {
-	if isQuery(query) {
-		rows, err := conn.QueryContext(ctx, query, args...)
-		if err != nil {
-			return nil, err
-		}
-		defer rows.Close()
-
-		cols, err := rows.Columns()
-		if err != nil {
-			return nil, err
-		}
-
-		// Prepare scanning arguments
-		scanArgs := make([]interface{}, len(cols))
-		values := make([]interface{}, len(cols))
-		for i := range values {
-			scanArgs[i] = &values[i]
-		}
-
-		resultRows := [][]interface{}{}
-		for rows.Next() {
-			if err := rows.Scan(scanArgs...); err != nil {
-				return nil, err
-			}
-
-			rowVals := make([]interface{}, len(cols))
-			for i, v := range values {
-				switch val := v.(type) {
-				case []byte:
-					// Strings are often scanned as []byte, decode to UTF-8 string
-					rowVals[i] = string(val)
-				default:
-					rowVals[i] = val
-				}
-			}
-			resultRows = append(resultRows, rowVals)
-		}
-
-		if err := rows.Err(); err != nil {
-			return nil, err
-		}
-
-		return &Results{
-			Columns:     cols,
-			Rows:        resultRows,
-			RowsRead:    int64(len(resultRows)),
-			RowsWritten: 0,
-		}, nil
-	}
-
-	// For mutation/DDL queries, execute using ExecContext
-	res, err := conn.ExecContext(ctx, query, args...)
-	if err != nil {
-		return nil, err
-	}
-
-	rowsWritten := safeRowsAffected(res)
-	return &Results{
-		Columns:     []string{},
-		Rows:        [][]interface{}{},
-		RowsRead:    0,
-		RowsWritten: rowsWritten,
-	}, nil
-}
-
-
